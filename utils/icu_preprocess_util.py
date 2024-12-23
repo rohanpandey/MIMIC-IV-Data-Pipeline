@@ -1,5 +1,6 @@
 import csv
 import numpy as np
+import polars as pl
 import pandas as pd
 import sys, os
 import re
@@ -9,312 +10,400 @@ from tqdm import tqdm
 
 from sklearn.preprocessing import MultiLabelBinarizer
 
+
 ########################## GENERAL ##########################
-def dataframe_from_csv(path, compression='gzip', header=0, index_col=0, chunksize=None):
-    return pd.read_csv(path, compression=compression, header=header, index_col=index_col, chunksize=None)
+def dataframe_from_csv(path, compression="gzip"):
+    return pl.read_csv(path)
+
 
 def read_admissions_table(mimic4_path):
-    admits = dataframe_from_csv(os.path.join(mimic4_path, 'core/admissions.csv.gz'))
-    admits=admits.reset_index()
-    admits = admits[['subject_id', 'hadm_id', 'admittime', 'dischtime', 'deathtime', 'ethnicity']]
-    admits.admittime = pd.to_datetime(admits.admittime)
-    admits.dischtime = pd.to_datetime(admits.dischtime)
-    admits.deathtime = pd.to_datetime(admits.deathtime)
+    path = os.path.join(mimic4_path, "core/admissions.csv.gz")
+    admits = pl.read_csv(path, try_parse_dates=True)
+    admits = admits.select(
+        ["subject_id", "hadm_id", "admittime", "dischtime", "deathtime", "ethnicity"]
+    )
     return admits
 
 
 def read_patients_table(mimic4_path):
-    pats = dataframe_from_csv(os.path.join(mimic4_path, 'core/patients.csv.gz'))
-    pats = pats.reset_index()
-    pats = pats[['subject_id', 'gender','dod','anchor_age','anchor_year', 'anchor_year_group']]
-    pats['yob']= pats['anchor_year'] - pats['anchor_age']
-    #pats.dob = pd.to_datetime(pats.dob)
-    pats.dod = pd.to_datetime(pats.dod)
+    path = os.path.join(mimic4_path, "core/patients.csv.gz")
+    pats = pl.read_csv(path, try_parse_dates=True)
+    pats = pats.select(
+        [
+            "subject_id",
+            "gender",
+            "dod",
+            "anchor_age",
+            "anchor_year",
+            "anchor_year_group",
+        ]
+    )
+    pats = pats.with_column((pl.col("anchor_year") - pl.col("anchor_age")).alias("yob"))
     return pats
 
 
 ########################## DIAGNOSES ##########################
 def read_diagnoses_icd_table(mimic4_path):
-    diag = dataframe_from_csv(os.path.join(mimic4_path, 'hosp/diagnoses_icd.csv.gz'))
-    diag.reset_index(inplace=True)
+    path = os.path.join(mimic4_path, "hosp/diagnoses_icd.csv.gz")
+    diag = pl.read_csv(path)
     return diag
 
 
 def read_d_icd_diagnoses_table(mimic4_path):
-    d_icd = dataframe_from_csv(os.path.join(mimic4_path, 'hosp/d_icd_diagnoses.csv.gz'))
-    d_icd.reset_index(inplace=True)
-    return d_icd[['icd_code', 'long_title']]
+    path = os.path.join(mimic4_path, "hosp/d_icd_diagnoses.csv.gz")
+    d_icd = pl.read_csv(path)
+    d_icd = d_icd.select(["icd_code", "long_title"])
+    return d_icd
 
 
 def read_diagnoses(mimic4_path):
-    return read_diagnoses_icd_table(mimic4_path).merge(
-        read_d_icd_diagnoses_table(mimic4_path), how='inner', left_on=['icd_code'], right_on=['icd_code']
-    )
+    diag_icd = read_diagnoses_icd_table(mimic4_path)
+    d_icd = read_d_icd_diagnoses_table(mimic4_path)
+    diag = diag_icd.join(d_icd, on="icd_code", how="inner")
+    return diag
 
 
-def standardize_icd(mapping, df, root=False):
+def standardize_icd(mapping: pl.DataFrame, df: pl.DataFrame, root=False):
     """Takes an ICD9 -> ICD10 mapping table and a diagnosis dataframe; adds column with converted ICD10 column"""
 
-    def icd_9to10(icd):
-        # If root is true, only map an ICD 9 -> 10 according to the ICD9's root (first 3 digits)
-        if root:
-            icd = icd[:3]
-        try:
-            # Many ICD-9's do not have a 1-to-1 mapping; get first index of mapped codes
-            return mapping.loc[mapping.diagnosis_code == icd].icd10cm.iloc[0]
-        except:
-            print("Error on code", icd)
-            return np.nan
+    col_name = "icd10_convert"
+    if root:
+        col_name = "root_" + col_name
 
-    # Create new column with original codes as default
-    col_name = 'icd10_convert'
-    if root: col_name = 'root_' + col_name
-    df[col_name] = df['icd_code'].values
+    if root:
+        df = df.with_column(
+            pl.when(pl.col("icd_version") == 9)
+            .then(pl.col("icd_code").str.slice(0, 3))
+            .alias("icd9_code")
+        )
+    else:
+        df = df.with_column(
+            pl.when(pl.col("icd_version") == 9)
+            .then(pl.col("icd_code"))
+            .alias("icd9_code")
+        )
 
-    # Group identical ICD9 codes, then convert all ICD9 codes within a group to ICD10
-    for code, group in df.loc[df.icd_version == 9].groupby(by='icd_code'):
-        new_code = icd_9to10(code)
-        for idx in group.index.values:
-            # Modify values of original df at the indexes in the groups
-            df.at[idx, col_name] = new_code
+    df = df.join(mapping, left_on="icd9_code", right_on="diagnosis_code", how="left")
+
+    df = df.with_column(
+        pl.when(pl.col("icd_version") == 9)
+        .then(
+            pl.when(pl.col("icd10cm").is_null())
+            .then(pl.col("icd_code"))
+            .otherwise(pl.col("icd10cm"))
+        )
+        .otherwise(pl.col("icd_code"))
+        .alias(col_name)
+    )
+
+    df = df.drop(["icd9_code", "diagnosis_code", "icd10cm", "diagnosis_description"])
+    return df
 
 
 ########################## PROCEDURES ##########################
 def read_procedures_icd_table(mimic4_path):
-    proc = dataframe_from_csv(os.path.join(mimic4_path, 'hosp/procedures_icd.csv.gz'))
-    proc.reset_index(inplace=True)
+    path = os.path.join(mimic4_path, "hosp/procedures_icd.csv.gz")
+    proc = pl.read_csv(path)
     return proc
 
 
 def read_d_icd_procedures_table(mimic4_path):
-    p_icd = dataframe_from_csv(os.path.join(mimic4_path, 'hosp/d_icd_procedures.csv.gz'))
-    p_icd.reset_index(inplace=True)
-    return p_icd[['icd_code', 'long_title']]
+    path = os.path.join(mimic4_path, "hosp/d_icd_procedures.csv.gz")
+    p_icd = pl.read_csv(path)
+    p_icd = p_icd.select(["icd_code", "long_title"])
+    return p_icd
 
 
 def read_procedures(mimic4_path):
-    return read_procedures_icd_table(mimic4_path).merge(
-        read_d_icd_procedures_table(mimic4_path), how='inner', left_on=['icd_code'], right_on=['icd_code']
-    )
+    proc_icd = read_procedures_icd_table(mimic4_path)
+    p_icd = read_d_icd_procedures_table(mimic4_path)
+    proc = proc_icd.join(p_icd, on="icd_code", how="inner")
+    return proc
 
 
 ########################## MAPPING ##########################
 def read_icd_mapping(map_path):
-    mapping = pd.read_csv(map_path, header=0, delimiter='\t')
-    mapping.diagnosis_description = mapping.diagnosis_description.apply(str.lower)
+    mapping = pl.read_csv(map_path, separator="\t")
+    mapping = mapping.with_column(pl.col("diagnosis_description").str.to_lowercase())
     return mapping
 
 
 ########################## PREPROCESSING ##########################
 
-def preproc_meds(module_path:str, adm_cohort_path:str) -> pd.DataFrame:
-  
-    adm = pd.read_csv(adm_cohort_path, usecols=['hadm_id', 'stay_id', 'intime'], parse_dates = ['intime'])
-    med = pd.read_csv(module_path, compression='gzip', usecols=['subject_id', 'stay_id', 'itemid', 'starttime', 'endtime','rate','amount','orderid'], parse_dates = ['starttime', 'endtime'])
-    med = med.merge(adm, left_on = 'stay_id', right_on = 'stay_id', how = 'inner')
-    med['start_hours_from_admit'] = med['starttime'] - med['intime']
-    med['stop_hours_from_admit'] = med['endtime'] - med['intime']
-    
-    #print(med.isna().sum())
-    med=med.dropna()
-    #med[['amount','rate']]=med[['amount','rate']].fillna(0)
-    print("# of unique type of drug: ", med.itemid.nunique())
-    print("# Admissions:  ", med.stay_id.nunique())
-    print("# Total rows",  med.shape[0])
-    
+
+def preproc_meds(module_path: str, adm_cohort_path: str) -> pl.DataFrame:
+
+    adm = pl.read_csv(
+        adm_cohort_path, columns=["hadm_id", "stay_id", "intime"], try_parse_dates=True
+    )
+    med = pl.read_csv(
+        module_path,
+        columns=[
+            "subject_id",
+            "stay_id",
+            "itemid",
+            "starttime",
+            "endtime",
+            "rate",
+            "amount",
+            "orderid",
+        ],
+        parse_dates=True,
+    )
+    med = med.join(adm, on="stay_id", how="inner")
+    med = med.with_columns(
+        [
+            (pl.col("starttime") - pl.col("intime")).alias("start_hours_from_admit"),
+            (pl.col("endtime") - pl.col("intime")).alias("stop_hours_from_admit"),
+        ]
+    )
+    med = med.drop_nulls()
+    print("# of unique type of drug: ", med["itemid"].n_unique())
+    print("# Admissions:  ", med["stay_id"].n_unique())
+    print("# Total rows", med.shape[0])
     return med
-    
-def preproc_proc(dataset_path: str, cohort_path:str, time_col:str, dtypes: dict, usecols: list) -> pd.DataFrame:
+
+
+def preproc_proc(
+    dataset_path: str, cohort_path: str, time_col: str, dtypes: dict, usecols: list
+) -> pl.DataFrame:
     """Function for getting hosp observations pertaining to a pickled cohort. Function is structured to save memory when reading and transforming data."""
 
-    def merge_module_cohort() -> pd.DataFrame:
+    def merge_module_cohort() -> pl.DataFrame:
         """Gets the initial module data with patients anchor year data and only the year of the charttime"""
-        
-        # read module w/ custom params
-        module = pd.read_csv(dataset_path, compression='gzip', usecols=usecols, dtype=dtypes, parse_dates=[time_col]).drop_duplicates()
-        #print(module.head())
-        # Only consider values in our cohort
-        cohort = pd.read_csv(cohort_path, compression='gzip', parse_dates = ['intime'])
-        
-        #print(module.head())
-        #print(cohort.head())
-
-        # merge module and cohort
-        return module.merge(cohort[['subject_id','hadm_id','stay_id', 'intime','outtime']], how='inner', left_on='stay_id', right_on='stay_id')
+        module = pl.read_csv(
+            dataset_path,
+            columns=usecols,
+            dtypes=dtypes,
+            try_parse_dates=True,
+        ).unique()
+        cohort = pl.read_csv(cohort_path, try_parse_dates=True)
+        return module.join(
+            cohort.select(["subject_id", "hadm_id", "stay_id", "intime", "outtime"]),
+            on="stay_id",
+            how="inner",
+        )
 
     df_cohort = merge_module_cohort()
-    df_cohort['event_time_from_admit'] = df_cohort[time_col] - df_cohort['intime']
-    
-    df_cohort=df_cohort.dropna()
-    # Print unique counts and value_counts
-    print("# Unique Events:  ", df_cohort.itemid.dropna().nunique())
-    print("# Admissions:  ", df_cohort.stay_id.nunique())
+    df_cohort = df_cohort.with_column(
+        (pl.col(time_col) - pl.col("intime")).alias("event_time_from_admit")
+    )
+    df_cohort = df_cohort.drop_nulls()
+    print("# Unique Events:  ", df_cohort["itemid"].drop_nulls().n_unique())
+    print("# Admissions:  ", df_cohort["stay_id"].n_unique())
     print("Total rows", df_cohort.shape[0])
-
-    # Only return module measurements within the observation range, sorted by subject_id
     return df_cohort
 
-def preproc_out(dataset_path: str, cohort_path:str, time_col:str, dtypes: dict, usecols: list) -> pd.DataFrame:
+
+def preproc_out(
+    dataset_path: str, cohort_path: str, time_col: str, dtypes: dict, usecols: list
+) -> pl.DataFrame:
     """Function for getting hosp observations pertaining to a pickled cohort. Function is structured to save memory when reading and transforming data."""
 
-    def merge_module_cohort() -> pd.DataFrame:
-        """Gets the initial module data with patients anchor year data and only the year of the charttime"""
-        
-        # read module w/ custom params
-        module = pd.read_csv(dataset_path, compression='gzip', usecols=usecols, dtype=dtypes, parse_dates=[time_col]).drop_duplicates()
-        #print(module.head())
-        # Only consider values in our cohort
-        cohort = pd.read_csv(cohort_path, compression='gzip', parse_dates = ['intime'])
-        
-        #print(module.head())
-        #print(cohort.head())
-
-        # merge module and cohort
-        return module.merge(cohort[['stay_id', 'intime','outtime']], how='inner', left_on='stay_id', right_on='stay_id')
+    def merge_module_cohort() -> pl.DataFrame:
+        module = pl.read_csv(
+            dataset_path,
+            columns=usecols,
+            dtypes=dtypes,
+            try_parse_dates=True,
+        ).unique()
+        cohort = pl.read_csv(cohort_path, try_parse_dates=True)
+        return module.join(
+            cohort.select(["stay_id", "intime", "outtime"]), on="stay_id", how="inner"
+        )
 
     df_cohort = merge_module_cohort()
-    df_cohort['event_time_from_admit'] = df_cohort[time_col] - df_cohort['intime']
-    df_cohort=df_cohort.dropna()
-    # Print unique counts and value_counts
-    print("# Unique Events:  ", df_cohort.itemid.nunique())
-    print("# Admissions:  ", df_cohort.stay_id.nunique())
+    df_cohort = df_cohort.with_column(
+        (pl.col(time_col) - pl.col("intime")).alias("event_time_from_admit")
+    )
+    df_cohort = df_cohort.drop_nulls()
+    print("# Unique Events:  ", df_cohort["itemid"].n_unique())
+    print("# Admissions:  ", df_cohort["stay_id"].n_unique())
     print("Total rows", df_cohort.shape[0])
-
-    # Only return module measurements within the observation range, sorted by subject_id
     return df_cohort
 
-def preproc_chart(dataset_path: str, cohort_path:str, time_col:str, dtypes: dict, usecols: list) -> pd.DataFrame:
+
+def preproc_chart(
+    dataset_path: str, cohort_path: str, time_col: str, dtypes: dict, usecols: list
+) -> pl.DataFrame:
     """Function for getting hosp observations pertaining to a pickled cohort. Function is structured to save memory when reading and transforming data."""
-    
-    # Only consider values in our cohort
-    cohort = pd.read_csv(cohort_path, compression='gzip', parse_dates = ['intime'])
-    df_cohort=pd.DataFrame()
-        # read module w/ custom params
-    chunksize = 10000000
-    count=0
-    nitem=[]
-    nstay=[]
-    nrows=0
-    for chunk in tqdm(pd.read_csv(dataset_path, compression='gzip', usecols=usecols, dtype=dtypes, parse_dates=[time_col],chunksize=chunksize)):
-        #print(chunk.head())
-        count=count+1
-        #chunk['valuenum']=chunk['valuenum'].fillna(0)
-        chunk=chunk.dropna(subset=['valuenum'])
-        chunk_merged=chunk.merge(cohort[['stay_id', 'intime']], how='inner', left_on='stay_id', right_on='stay_id')
-        chunk_merged['event_time_from_admit'] = chunk_merged[time_col] - chunk_merged['intime']
-        
-        del chunk_merged[time_col] 
-        del chunk_merged['intime']
-        chunk_merged=chunk_merged.dropna()
-        chunk_merged=chunk_merged.drop_duplicates()
-        if df_cohort.empty:
-            df_cohort=chunk_merged
-        else:
-            df_cohort=df_cohort.append(chunk_merged, ignore_index=True)
-        
-        
-#         nitem.append(chunk_merged.itemid.dropna().unique())
-#         nstay=nstay.append(chunk_merged.stay_id.unique())
-#         nrows=nrows+chunk_merged.shape[0]
-                
-        
-    
-    # Print unique counts and value_counts
-#     print("# Unique Events:  ", len(set(nitem)))
-#     print("# Admissions:  ", len(set(nstay)))
-#     print("Total rows", nrows)
-    print("# Unique Events:  ", df_cohort.itemid.nunique())
-    print("# Admissions:  ", df_cohort.stay_id.nunique())
-    print("Total rows", df_cohort.shape[0])
 
-    # Only return module measurements within the observation range, sorted by subject_id
+    # using scan_csv, polars will automatically try to use streaming, which is more memory efficient
+    # every operation in this function is lazy, so no data is loaded into memory until the final collect
+
+    cohort = pl.scan_csv(cohort_path, try_parse_dates=True)
+
+    query = (
+        pl.scan_csv(dataset_path, try_parse_dates=True)
+        .select(usecols)
+        .drop_nulls(subset=["valuenum"])
+        .join(cohort.select(["stay_id", "intime"]), on="stay_id", how="inner")
+        .with_columns(
+            (pl.col(time_col) - pl.col("intime")).alias("event_time_from_admit")
+        )
+        .drop_nulls()
+        .unique()
+    )
+
+    df_cohort = query.collect()
+
+    print("# Unique Events:  ", df_cohort["itemid"].n_unique())
+    print("# Admissions:  ", df_cohort["stay_id"].n_unique())
+    print("Total rows", df_cohort.shape[0])
     return df_cohort
 
-def preproc_icd_module(module_path:str, adm_cohort_path:str, icd_map_path=None, map_code_colname=None, only_icd10=True) -> pd.DataFrame:
-    """Takes an module dataset with ICD codes and puts it in long_format, optionally mapping ICD-codes by a mapping table path"""    
-    
-    def get_module_cohort(module_path:str, cohort_path:str):
-        module = pd.read_csv(module_path, compression='gzip', header=0)
-        adm_cohort = pd.read_csv(adm_cohort_path, compression='gzip', header=0)
-        #print(module.head())
-        #print(adm_cohort.head())
-        
-        #adm_cohort = adm_cohort.loc[(adm_cohort.timedelta_years <= 6) & (~adm_cohort.timedelta_years.isna())]
-        return module.merge(adm_cohort[['hadm_id', 'stay_id', 'label']], how='inner', left_on='hadm_id', right_on='hadm_id')
+
+def preproc_icd_module(
+    module_path: str,
+    adm_cohort_path: str,
+    icd_map_path=None,
+    map_code_colname=None,
+    only_icd10=True,
+) -> pl.DataFrame:
+    """Takes an module dataset with ICD codes and puts it in long_format, optionally mapping ICD-codes by a mapping table path"""
+
+    def get_module_cohort(module_path: str, cohort_path: str):
+        module = pl.read_csv(module_path)
+        adm_cohort = pl.read_csv(adm_cohort_path)
+        return module.join(
+            adm_cohort.select(["hadm_id", "stay_id", "label"]),
+            on="hadm_id",
+            how="inner",
+        )
 
     def standardize_icd(mapping, df, root=False):
-        """Takes an ICD9 -> ICD10 mapping table and a modulenosis dataframe; adds column with converted ICD10 column"""
-        
-        def icd_9to10(icd):
-            # If root is true, only map an ICD 9 -> 10 according to the ICD9's root (first 3 digits)
-            if root:
-                icd = icd[:3]
-            try:
-                # Many ICD-9's do not have a 1-to-1 mapping; get first index of mapped codes
-                return mapping.loc[mapping[map_code_colname] == icd].icd10cm.iloc[0]
-            except:
-                #print("Error on code", icd)
-                return np.nan
+        """Takes an ICD9 -> ICD10 mapping table and a diagnosis dataframe; adds column with converted ICD10 column"""
 
-        # Create new column with original codes as default
-        col_name = 'icd10_convert'
-        if root: col_name = 'root_' + col_name
-        df[col_name] = df['icd_code'].values
+        col_name = "icd10_convert"
+        if root:
+            col_name = "root_" + col_name
 
-        # Group identical ICD9 codes, then convert all ICD9 codes within a group to ICD10
-        for code, group in df.loc[df.icd_version == 9].groupby(by='icd_code'):
-            new_code = icd_9to10(code)
-            for idx in group.index.values:
-                # Modify values of original df at the indexes in the groups
-                df.at[idx, col_name] = new_code
+        if root:
+            df = df.with_column(
+                pl.when(pl.col("icd_version") == 9)
+                .then(pl.col("icd_code").str.slice(0, 3))
+                .alias("icd9_code")
+            )
+        else:
+            df = df.with_column(
+                pl.when(pl.col("icd_version") == 9)
+                .then(pl.col("icd_code"))
+                .alias("icd9_code")
+            )
+
+        df = df.join(
+            mapping, left_on="icd9_code", right_on=map_code_colname, how="left"
+        )
+
+        df = df.with_column(
+            pl.when(pl.col("icd_version") == 9)
+            .then(
+                pl.when(pl.col("icd10cm").is_null())
+                .then(pl.col("icd_code"))
+                .otherwise(pl.col("icd10cm"))
+            )
+            .otherwise(pl.col("icd_code"))
+            .alias(col_name)
+        )
 
         if only_icd10:
-            # Column for just the roots of the converted ICD10 column
-            df['root'] = df[col_name].apply(lambda x: x[:3] if type(x) is str else np.nan)
+            df = df.with_column(pl.col(col_name).str.slice(0, 3).alias("root"))
+
+        df = df.drop(
+            ["icd9_code", map_code_colname, "icd10cm", "diagnosis_description"]
+        )
+        return df
 
     module = get_module_cohort(module_path, adm_cohort_path)
-    #print(module.shape)
-    #print(module['icd_code'].nunique())
-
-    # Optional ICD mapping if argument passed
     if icd_map_path:
         icd_map = read_icd_mapping(icd_map_path)
-        #print(icd_map)
-        standardize_icd(icd_map, module, root=True)
-        print("# unique ICD-9 codes",module[module['icd_version']==9]['icd_code'].nunique())
-        print("# unique ICD-10 codes",module[module['icd_version']==10]['icd_code'].nunique())
-        print("# unique ICD-10 codes (After converting ICD-9 to ICD-10)",module['root_icd10_convert'].nunique())
-        print("# unique ICD-10 codes (After clinical gruping ICD-10 codes)",module['root'].nunique())
-        print("# Admissions:  ", module.stay_id.nunique())
+        module = standardize_icd(icd_map, module, root=True)
+        print(
+            "# unique ICD-9 codes",
+            module.filter(pl.col("icd_version") == 9)["icd_code"].n_unique(),
+        )
+        print(
+            "# unique ICD-10 codes",
+            module.filter(pl.col("icd_version") == 10)["icd_code"].n_unique(),
+        )
+        print(
+            "# unique ICD-10 codes (After converting ICD-9 to ICD-10)",
+            module["root_icd10_convert"].n_unique(),
+        )
+        print(
+            "# unique ICD-10 codes (After clinical grouping ICD-10 codes)",
+            module["root"].n_unique(),
+        )
+        print("# Admissions:  ", module["stay_id"].n_unique())
         print("Total rows", module.shape[0])
     return module
 
 
-def pivot_cohort(df: pd.DataFrame, prefix: str, target_col:str, values='values', use_mlb=False, ohe=True, max_features=None):
+def pivot_cohort(
+    df: pl.DataFrame,
+    prefix: str,
+    target_col: str,
+    values="values",
+    use_mlb=False,
+    ohe=True,
+    max_features=None,
+):
     """Pivots long_format data into a multiindex array:
-                                            || feature 1 || ... || feature n ||
-        || subject_id || label || timedelta ||
+                                        || feature 1 || ... || feature n ||
+    || subject_id || label || timedelta ||
     """
-    aggfunc = np.mean
-    pivot_df = df.dropna(subset=[target_col])
-
     if use_mlb:
         mlb = MultiLabelBinarizer()
-        output = mlb.fit_transform(pivot_df[target_col].apply(ast.literal_eval))
-        output = pd.DataFrame(output, columns=mlb.classes_)
+        df_pandas = df.to_pandas()
+        # pandas still gets used here because of the literal_eval function
+        output = mlb.fit_transform(df_pandas[target_col].apply(ast.literal_eval))
+        output_df = pl.from_pandas(pd.DataFrame(output, columns=mlb.classes_))
         if max_features:
-            top_features = output.sum().sort_values(ascending=False).index[:max_features]
-            output = output[top_features]
-        pivot_df = pd.concat([pivot_df[['subject_id', 'label', 'timedelta']].reset_index(drop=True), output], axis=1)
-        pivot_df = pd.pivot_table(pivot_df, index=['subject_id', 'label', 'timedelta'], values=pivot_df.columns[3:], aggfunc=np.max)
+            top_features = output_df.sum().sort("values", reverse=True)[:max_features][
+                "feature"
+            ]
+            output_df = output_df.select(top_features)
+        df_pandas = pd.concat(
+            [
+                df_pandas[["subject_id", "label", "timedelta"]].reset_index(drop=True),
+                output_df.to_pandas(),
+            ],
+            axis=1,
+        )
+        pivot_df = df_pandas.pivot_table(
+            index=["subject_id", "label", "timedelta"],
+            values=df_pandas.columns[3:],
+            aggfunc=np.max,
+        )
+        pivot_df.columns = [prefix + str(i) for i in pivot_df.columns]
+        return pl.from_pandas(pivot_df)
     else:
         if max_features:
-            top_features = pd.Series(pivot_df[['subject_id', target_col]].drop_duplicates()[target_col].value_counts().index[:max_features], name=target_col)
-            pivot_df = pivot_df.merge(top_features, how='inner', left_on=target_col, right_on=target_col)
+            top_features = (
+                df.select(target_col)
+                .unique()
+                .to_series()
+                .value_counts()
+                .head(max_features)
+                .index
+            )
+            df = df.filter(pl.col(target_col).is_in(top_features))
         if ohe:
-            pivot_df = pd.concat([pivot_df.reset_index(drop=True), pd.Series(np.ones(pivot_df.shape[0], dtype=int), name='values')], axis=1)
-            aggfunc = np.max
-        pivot_df = pivot_df.pivot_table(index=['subject_id', 'label', 'timedelta'], columns=target_col, values=values, aggfunc=aggfunc)
-
-    pivot_df.columns = [prefix + str(i) for i in pivot_df.columns]
-    return pivot_df
+            df = df.with_column(pl.lit(1).alias("values"))
+            pivot_df = df.pivot(
+                values="values",
+                index=["subject_id", "label", "timedelta"],
+                columns=target_col,
+                aggregate_function="max",
+            )
+        else:
+            pivot_df = df.pivot(
+                values=values,
+                index=["subject_id", "label", "timedelta"],
+                columns=target_col,
+                aggregate_function="mean",
+            )
+        pivot_df = pivot_df.select(
+            [pl.col(col).alias(prefix + str(col)) for col in pivot_df.columns]
+        )
+        return pivot_df
